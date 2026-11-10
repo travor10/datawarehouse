@@ -450,6 +450,49 @@ class TestDatabaseSchema(unittest.TestCase):
 
         test_conn.close()
 
+    def test_12_failed_migration_retry_success(self):
+        """
+        Regression Test: Verifies that a failed migration can be fixed and retried,
+        updating the existing audit record to SUCCESS without duplicate key errors.
+        """
+        import tempfile
+        from config.database import MigrationExecutionError
+
+        test_conn = sqlite3.connect(":memory:")
+        test_conn.row_factory = sqlite3.Row
+        test_conn.execute("PRAGMA foreign_keys = ON;")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            migration_file = tmp_path / "998_retry_test.sql"
+
+            # 1. First Run: Script has a syntax error
+            migration_file.write_text("SELECT * FROM FROM WHERE ; INVALID_SQL ;")
+            with self.assertRaises(MigrationExecutionError):
+                self.db_manager.run_migrations(migrations_dir=tmp_path, conn=test_conn)
+
+            # 2. Verify it is recorded as 'FAILED'
+            cursor = test_conn.cursor()
+            cursor.execute("SELECT status FROM _schema_migrations WHERE version = '998_retry_test';")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row, "Failed migration must be recorded in _schema_migrations")
+            self.assertEqual(row["status"], "FAILED")
+
+            # 3. Second Run: Fix the migration file with valid non-destructive DDL
+            migration_file.write_text("CREATE TABLE IF NOT EXISTS Temp_Retry_Test (test_id INTEGER PRIMARY KEY);")
+
+            # Retrying MUST succeed without duplicate key error on version
+            applied = self.db_manager.run_migrations(migrations_dir=tmp_path, conn=test_conn)
+            self.assertIn("998_retry_test", applied)
+
+            # 4. Verify audit record is updated to 'SUCCESS' and no duplicate records exist
+            cursor.execute("SELECT COUNT(*) AS total, status FROM _schema_migrations WHERE version = '998_retry_test';")
+            updated_row = cursor.fetchone()
+            self.assertEqual(updated_row["total"], 1, "There must be exactly 1 audit record for the version (no duplicates)")
+            self.assertEqual(updated_row["status"], "SUCCESS", "Status must be updated to SUCCESS on successful retry")
+
+        test_conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

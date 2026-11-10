@@ -70,45 +70,81 @@ To prevent duplicate data loading when reprocessing identical historical reports
 
 ---
 
-## 5. Deployment Procedures: MySQL 8 (Authoritative)
+## 5. Deployment Procedures: Authoritative Pipeline vs. Modular Reference Files
 
-### Non-Destructive Standard Deployment
-All standard DDL scripts use `CREATE DATABASE IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` to ensure repeated deployment safety without data loss:
+To prevent schema drift and ensure reproducible schema evolution, this project enforces a single authoritative deployment hierarchy:
 
-1. **`database/create_database.sql`**: Initializes `aura_data_mart` non-destructively.
-2. **`database/create_dimensions.sql`**: Deploys the 6 Dimension tables.
-3. **`database/create_facts.sql`**: Deploys the 2 Fact tables with foreign keys and SHA-256 idempotency.
-4. **`database/create_views.sql`**: Compiles `vw_job_profitability_summary`.
-5. **`database/insert_reference_data.sql`**: Seeds reference data and populates calendar dates from 2023 through 2026.
+```
+                  AUTHORITATIVE SOURCE OF TRUTH
+                  database/migrations/*.sql
+                              │
+            ┌─────────────────┴─────────────────┐
+            │                                   │
+            ▼                                   ▼
+   AUTOMATED PIPELINE                  MODULAR ARCHITECTURAL VIEW
+python database/run_migrations.py      database/*.sql (Reference Only)
+- 001_initial_schema.sql               - create_dimensions.sql
+- SHA-256 Checksum Guard               - create_facts.sql
+- Retry Recovery via Upsert            - create_views.sql
+- Logs in _schema_migrations           - insert_reference_data.sql
+```
 
-### Dedicated Development Reset (Destructive)
-For local development or testing environments where a fresh reset is explicitly required:
-- Run **`database/reset_database.sql`** (contains `DROP DATABASE IF EXISTS`).
-- Never run this script in production.
+### Path A: Automated Migration Runner (Primary & Authoritative)
+The migration engine tracks version history in `_schema_migrations`, verifies cryptographic SHA-256 checksums to detect schema tampering, and applies changes in deterministic alphanumeric sequence.
+
+1. **Create the target database (if not already existing):**
+   ```bash
+   mysql -u root -p < database/create_database.sql
+   ```
+2. **Execute the automated migration pipeline:**
+   ```bash
+   python database/run_migrations.py
+   # Or explicitly specifying the engine:
+   python database/run_migrations.py --engine mysql
+   ```
+3. **Dedicated Development Reset (Destructive):**
+   - For local development teardowns only: `mysql -u root -p < database/reset_database.sql`
+   - *Never execute the reset script in production environments.*
+
+### MySQL DDL Implicit Commit & Retry Recovery
+In MySQL 8, all Data Definition Language (DDL) statements (`CREATE TABLE`, `ALTER TABLE`, `CREATE PROCEDURE`, `DROP PROCEDURE`) trigger an **implicit commit**. Unlike SQLite, if a multi-statement migration encounters an error midway through execution, MySQL cannot roll back the preceding DDL statements via a transactional `ROLLBACK`.
+
+To handle this behavior safely:
+- All DDL statements in migration files are designed with idempotent guards (`CREATE TABLE IF NOT EXISTS`, `CREATE OR REPLACE VIEW`, `DROP PROCEDURE IF EXISTS`).
+- If an error occurs, the migration is recorded with `status = 'FAILED'`.
+- Upon fixing the underlying condition (e.g. permission or syntax issue), re-running `run_migrations()` safely skips already-created objects and **updates the existing audit record** from `FAILED` to `SUCCESS` via an upsert query, preventing duplicate key violations on the unique `version` column.
 
 ---
 
-## 6. Step-by-Step MySQL Workbench Execution Instructions (Windows)
+## 6. MySQL Workbench Execution Instructions (Windows / GUI Alternative)
 
-1. **Launch MySQL Workbench** and connect to your local MySQL 8 instance (`localhost:3306`).
-2. **Open and execute scripts** via `File -> Open SQL Script...` in this exact order:
-   - `database/create_database.sql`
-   - `database/create_dimensions.sql`
-   - `database/create_facts.sql`
-   - `database/create_views.sql`
-   - `database/insert_reference_data.sql`
-3. **Execute Integration Verification:**
-   - Open and run **`database/verify_mysql.sql`**.
-   - This script runs a 9-point verification check and outputs an automated scorecard:
-     - Database collation (`utf8mb4_unicode_ci`)
-     - Table count (8 base tables)
-     - Reporting view presence
-     - Foreign key constraint count
-     - SHA-256 provenance keys
-     - Positive expense check constraint
-     - Stored procedures (`sp_populate_dim_date`, `sp_extend_dim_date`)
-     - 7 canonical service categories & 6 expense categories
-     - Date dimension coverage through 2026-12-31
+For manual review, academic demonstration, or environments where Python CLI execution is restricted, MySQL Workbench can be used.
+
+### Authoritative Full Baseline via Workbench
+1. Launch **MySQL Workbench** and connect to your local MySQL 8 instance (`localhost:3306`).
+2. Open and execute **`database/create_database.sql`** to initialize `aura_data_mart`.
+3. Open and execute **`database/migrations/001_initial_schema.sql`**:
+   - MySQL Workbench handles `DELIMITER $$` directives natively.
+   - Click the **Execute (Lightning Bolt)** icon to deploy all dimensions, facts, views, reference data, and calendar procedures in one pass.
+
+### Modular Reference Files (`database/*.sql`)
+The individual files in `database/` are decomposed architectural representations maintained for modular academic defense and targeted inspection:
+- `database/create_dimensions.sql`: 6 Dimension table DDLs.
+- `database/create_facts.sql`: 2 Fact table DDLs with provenance keys.
+- `database/create_views.sql`: `vw_job_profitability_summary` view DDL.
+- `database/insert_reference_data.sql`: Taxonomy seeds and date generation stored procedures.
+
+### Post-Deployment Verification Audit
+Open and execute **`database/verify_mysql.sql`** in Workbench. This script runs a 9-point audit and outputs a structured compliance scorecard:
+1. Database collation (`utf8mb4_unicode_ci`)
+2. Table count (8 base tables)
+3. Reporting view presence (`vw_job_profitability_summary`)
+4. Foreign key constraint count (8 relational FKs)
+5. SHA-256 provenance idempotency keys on facts
+6. Positive expense check constraint
+7. Stored procedures (`sp_populate_dim_date`, `sp_extend_dim_date`)
+8. Canonical taxonomies (7 service categories, 6 expense categories)
+9. Date dimension coverage through 2026-12-31
 
 ---
 

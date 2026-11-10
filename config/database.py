@@ -397,15 +397,59 @@ class DatabaseManager:
         if close_at_end:
             conn.close()
 
+    def _record_migration_result(
+        self,
+        cursor,
+        version: str,
+        description: str,
+        checksum: str,
+        execution_time_ms: int,
+        status: str,
+    ):
+        """Inserts or updates migration audit records safely without duplicate key violations."""
+        if self.engine_type == "sqlite":
+            cursor.execute("SELECT migration_id FROM _schema_migrations WHERE version = ?;", (version,))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    "UPDATE _schema_migrations SET description = ?, checksum = ?, "
+                    "execution_time_ms = ?, status = ?, applied_at = CURRENT_TIMESTAMP WHERE version = ?;",
+                    (description, checksum, execution_time_ms, status, version),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
+                    "VALUES (?, ?, ?, ?, ?);",
+                    (version, description, checksum, execution_time_ms, status),
+                )
+        else:
+            cursor.execute("SELECT migration_id FROM _schema_migrations WHERE version = %s;", (version,))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    "UPDATE _schema_migrations SET description = %s, checksum = %s, "
+                    "execution_time_ms = %s, status = %s, applied_at = CURRENT_TIMESTAMP WHERE version = %s;",
+                    (description, checksum, execution_time_ms, status, version),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
+                    "VALUES (%s, %s, %s, %s, %s);",
+                    (version, description, checksum, execution_time_ms, status),
+                )
+
     def run_migrations(self, migrations_dir: Optional[Path] = None, conn=None) -> List[str]:
         """
         Executes pending forward schema migrations in alphanumeric order with SHA-256 checksum protection.
         
-        Failure Policy:
-        - If a previously applied migration file has been altered, raises MigrationChecksumError and aborts.
-        - If a migration statement fails, the migration is NOT recorded as successful.
-        - In SQLite, the transaction is rolled back. In MySQL, note that MySQL DDL statements invoke
-          implicit commits and cannot be rolled back transactionally.
+        Failure & Retry Policy:
+        - If a previously SUCCESSFUL migration file has been altered, raises MigrationChecksumError and aborts.
+        - If a migration statement fails, it is recorded as 'FAILED' and raises MigrationExecutionError.
+        - Failed migrations can be safely retried once fixed; a successful retry updates the existing
+          audit record to 'SUCCESS' without duplicate key violations.
+        - In SQLite, statement failures rollback transactionally.
+        - In MySQL, MySQL DDL statements (CREATE/ALTER/DROP) invoke implicit commits at the engine level;
+          failed migrations require non-destructive idempotent statements or administrator inspection.
         """
         mgr_dir = migrations_dir or (DATABASE_DIR / "migrations")
         if not mgr_dir.exists():
@@ -419,7 +463,7 @@ class DatabaseManager:
         self.init_migration_table(conn=conn)
         cursor = conn.cursor()
 
-        # Step 1: Query already applied migrations and their recorded checksums
+        # Step 1: Query already applied successful migrations and their recorded checksums
         cursor.execute("SELECT version, checksum FROM _schema_migrations WHERE status = 'SUCCESS';")
         applied_records = {
             (row["version"] if isinstance(row, dict) else row[0]): (row["checksum"] if isinstance(row, dict) else row[1])
@@ -428,7 +472,7 @@ class DatabaseManager:
 
         migration_files = sorted(mgr_dir.glob("*.sql"))
 
-        # Step 2: Cryptographic Checksum Integrity Check on all previously applied migrations
+        # Step 2: Cryptographic Checksum Integrity Check on all previously successful migrations
         for m_file in migration_files:
             version = m_file.stem
             if version in applied_records:
@@ -445,7 +489,7 @@ class DatabaseManager:
                         f"Revert '{m_file.name}' or apply a new forward migration script."
                     )
 
-        # Step 3: Apply pending migrations
+        # Step 3: Apply pending or previously failed migrations
         applied_this_run = []
         for m_file in migration_files:
             version = m_file.stem
@@ -460,12 +504,13 @@ class DatabaseManager:
                 self.execute_script(m_file, conn=conn)
                 elapsed_ms = int((time.time() - t0) * 1000)
 
-                cursor.execute(
-                    "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
-                    "VALUES (?, ?, ?, ?, 'SUCCESS');" if self.engine_type == "sqlite" else
-                    "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
-                    "VALUES (%s, %s, %s, %s, 'SUCCESS');",
-                    (version, f"Applied from {m_file.name}", file_checksum, elapsed_ms),
+                self._record_migration_result(
+                    cursor,
+                    version=version,
+                    description=f"Applied from {m_file.name}",
+                    checksum=file_checksum,
+                    execution_time_ms=elapsed_ms,
+                    status="SUCCESS",
                 )
                 conn.commit()
                 applied_this_run.append(version)
@@ -473,18 +518,18 @@ class DatabaseManager:
                 if self.engine_type == "sqlite":
                     conn.rollback()
                 logger.error(f"Migration {version} failed: {e}")
-                # Record failure record if possible
                 try:
-                    cursor.execute(
-                        "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
-                        "VALUES (?, ?, ?, 0, 'FAILED');" if self.engine_type == "sqlite" else
-                        "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
-                        "VALUES (%s, %s, %s, 0, 'FAILED');",
-                        (version, f"FAILED: {str(e)[:200]}", file_checksum),
+                    self._record_migration_result(
+                        cursor,
+                        version=version,
+                        description=f"FAILED: {str(e)[:200]}",
+                        checksum=file_checksum,
+                        execution_time_ms=0,
+                        status="FAILED",
                     )
                     conn.commit()
-                except Exception:
-                    pass
+                except Exception as record_err:
+                    logger.warning(f"Failed to record migration failure state: {record_err}")
                 raise MigrationExecutionError(f"Migration '{version}' failed: {e}") from e
 
         if close_at_end:
