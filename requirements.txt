@@ -1,0 +1,24 @@
+# Aura Cleaning Solutions Data Mart - Python Dependencies
+# Academic Project: Data Warehousing and Business Intelligence
+# Target: Python 3.10+ on Windows / Linux / macOS
+
+# Database Drivers and ORM
+SQLAlchemy>=2.0.0
+PyMySQL>=1.1.0
+mysql-connector-python>=8.3.0
+
+# Data Manipulation and Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Spreadsheet and Document Parsing (Excel & PDF)
+openpyxl>=3.1.0
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+
+# Environment and Configuration Management
+python-dotenv>=1.0.0
+
+# Testing and Reporting
+pytest>=8.0.0
+tabulate>=0.9.0

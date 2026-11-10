@@ -1,0 +1,6 @@
+{
+  "name": "Aura Cleaning Solutions Data Mart",
+  "description": "Financial and operational performance data mart for Aura Cleaning Solutions, implementing a Kimball constellation schema, robust ETL pipeline, and analytical reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
