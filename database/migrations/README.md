@@ -15,30 +15,29 @@ Unlike transactional (OLTP) applications that frequently drop and rewrite tables
      - `CREATE TABLE IF NOT EXISTS <new_dimension_or_fact> (...);`
      - `CREATE INDEX IF NOT EXISTS <idx_name> ON <table> (<cols>);`
      - `CREATE OR REPLACE VIEW <view_name> AS ...;`
-2. **Never Drop Existing Data Columns or Tables:**
-   - Existing foreign keys, surrogate keys, and measure columns must never be dropped in production.
-   - Deprecated columns are flagged or nullable, preserving historical query reproducibility.
-3. **Idempotent and Replay-Safe:**
-   - Every migration script must be replay-safe: re-running a migration script against an already migrated database must either be a no-op or succeed cleanly.
+2. **Cryptographic Checksum Tracking & Immutability:**
+   - When a migration script is executed, `DatabaseManager.run_migrations()` calculates the SHA-256 cryptographic digest of the file contents and records it in `_schema_migrations.checksum`.
+   - On every subsequent run, all previously applied migration files are re-hashed.
+   - If an applied migration file has been modified or tampered with, the system raises `MigrationChecksumError` and refuses to continue.
+3. **Transaction & Failure Handling:**
+   - If a migration statement fails, the migration is **never** recorded as `SUCCESS`.
+   - In SQLite, the operation is rolled back transactionally.
+   - **MySQL DDL Limitation Note:** In MySQL 8, data definition language (DDL) statements (such as `CREATE TABLE`, `ALTER TABLE`, and `CREATE PROCEDURE`) cause an **implicit commit**. Therefore, DDL statements in MySQL cannot be rolled back with `ROLLBACK`. If a DDL statement fails, `DatabaseManager` logs the exact statement, records a `'FAILED'` status, and raises `MigrationExecutionError`.
 4. **Automated Version Tracking (`_schema_migrations`):**
-   - The database maintains an audit relation:
-     ```sql
-     CREATE TABLE IF NOT EXISTS _schema_migrations (
-         migration_id INT AUTO_INCREMENT PRIMARY KEY,
-         version VARCHAR(50) NOT NULL UNIQUE,
-         description VARCHAR(255) NOT NULL,
-         applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-         execution_time_ms INT NULL,
-         status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS'
-     );
-     ```
-   - Before applying a migration, `DatabaseManager.run_migrations()` checks `_schema_migrations`. If the version string is already recorded, the migration is skipped.
+   ```sql
+   CREATE TABLE IF NOT EXISTS _schema_migrations (
+       migration_id INT AUTO_INCREMENT PRIMARY KEY,
+       version VARCHAR(50) NOT NULL UNIQUE,
+       description VARCHAR(255) NOT NULL,
+       checksum VARCHAR(64) NOT NULL,
+       applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       execution_time_ms INT NULL,
+       status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS'
+   );
+   ```
 
 ---
 
-## 3. Migration File Naming Convention
+## 3. Migration Sequence
 
-Migration scripts inside `database/migrations/` follow zero-padded alphanumeric numbering:
-- `001_initial_schema.sql` (Baseline: 6 Dimensions, 2 Facts, 1 Profitability View, Reference Data)
-- `002_add_customer_segmentation.sql` (Future: e.g. adding RFM scoring attributes)
-- `003_add_equipment_meter_hours.sql` (Future: e.g. equipment run-time tracking)
+- `001_initial_schema.sql` (Baseline: 6 Dimensions, 2 Facts, 1 Profitability View, Reference Data, Stored Procedures, and Calendar from 2023 through 2026+)

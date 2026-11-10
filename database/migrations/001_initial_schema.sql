@@ -1,13 +1,23 @@
 -- =============================================================================
 -- Aura Cleaning Solutions Data Mart
 -- Migration: 001_initial_schema.sql
--- Description: Baseline schema deployment (6 Dimensions, 2 Facts, 1 View, Reference Data)
+-- Description: Baseline schema deployment:
+--              - 6 Dimension tables (Dim_Date, Dim_Location, Dim_Customer,
+--                Dim_Service, Dim_Expense_Category, Dim_Job)
+--              - 2 Fact tables (Fact_Job_Performance, Fact_Job_Expenses)
+--              - 1 Analytical view (vw_job_profitability_summary)
+--              - Canonical reference data (7 services, 6 expense categories)
+--              - Stored procedures (sp_populate_dim_date, sp_extend_dim_date)
+--              - Calendar dimension populated from 2023-01-01 through 2026-12-31
 -- Target Engine: MySQL 8.0+
 -- =============================================================================
 
 USE aura_data_mart;
 
--- 1. Dimensions
+-- =============================================================================
+-- 1. DIMENSION TABLES
+-- =============================================================================
+
 CREATE TABLE IF NOT EXISTS Dim_Date (
     date_key INT NOT NULL,
     full_date DATE NOT NULL,
@@ -102,7 +112,11 @@ CREATE TABLE IF NOT EXISTS Dim_Job (
     INDEX idx_dim_job_provenance (source_file_hash, source_record_locator)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 2. Fact Tables
+
+-- =============================================================================
+-- 2. FACT TABLES
+-- =============================================================================
+
 CREATE TABLE IF NOT EXISTS Fact_Job_Performance (
     performance_key BIGINT AUTO_INCREMENT NOT NULL,
     job_key INT NOT NULL,
@@ -181,7 +195,11 @@ CREATE TABLE IF NOT EXISTS Fact_Job_Expenses (
     INDEX idx_exp_batch (etl_batch_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 3. Profitability View
+
+-- =============================================================================
+-- 3. REPORTING VIEW
+-- =============================================================================
+
 CREATE OR REPLACE VIEW vw_job_profitability_summary AS
 SELECT
     j.job_key,
@@ -293,7 +311,11 @@ LEFT JOIN (
     GROUP BY job_key
 ) exp_agg ON j.job_key = exp_agg.job_key;
 
--- 4. Initial Reference Data
+
+-- =============================================================================
+-- 4. REFERENCE DATA SEEDING
+-- =============================================================================
+
 INSERT INTO Dim_Expense_Category (expense_category_name, cost_type) VALUES
 ('Labour Wages', 'Direct Operational Cost'),
 ('Transport & Fuel', 'Direct Operational Cost'),
@@ -321,3 +343,73 @@ INSERT INTO Dim_Service (service_code, service_name_clean, service_name_raw, ser
 ON DUPLICATE KEY UPDATE 
     service_name_clean = VALUES(service_name_clean),
     service_category = VALUES(service_category);
+
+
+-- =============================================================================
+-- 5. STORED PROCEDURES & CALENDAR POPULATION (2023-2026+)
+-- =============================================================================
+
+DROP PROCEDURE IF EXISTS sp_populate_dim_date;
+
+DELIMITER $$
+CREATE PROCEDURE sp_populate_dim_date(IN start_date DATE, IN end_date DATE)
+BEGIN
+    DECLARE current_dt DATE;
+    SET current_dt = start_date;
+
+    WHILE current_dt <= end_date DO
+        INSERT INTO Dim_Date (
+            date_key,
+            full_date,
+            day_of_week,
+            day_of_month,
+            month_num,
+            month_name,
+            quarter,
+            year_num,
+            is_weekend
+        ) VALUES (
+            CAST(DATE_FORMAT(current_dt, '%Y%m%d') AS UNSIGNED),
+            current_dt,
+            DAYNAME(current_dt),
+            DAY(current_dt),
+            MONTH(current_dt),
+            MONTHNAME(current_dt),
+            CONCAT('Q', QUARTER(current_dt)),
+            YEAR(current_dt),
+            CASE WHEN DAYOFWEEK(current_dt) IN (1, 7) THEN TRUE ELSE FALSE END
+        )
+        ON DUPLICATE KEY UPDATE full_date = VALUES(full_date);
+
+        SET current_dt = DATE_ADD(current_dt, INTERVAL 1 DAY);
+    END WHILE;
+END$$
+DELIMITER ;
+
+DROP PROCEDURE IF EXISTS sp_extend_dim_date;
+
+DELIMITER $$
+CREATE PROCEDURE sp_extend_dim_date(IN target_date DATE)
+BEGIN
+    DECLARE min_existing DATE;
+    DECLARE max_existing DATE;
+
+    IF target_date IS NOT NULL THEN
+        SELECT MIN(full_date), MAX(full_date) INTO min_existing, max_existing FROM Dim_Date;
+
+        IF min_existing IS NULL THEN
+            CALL sp_populate_dim_date(
+                STR_TO_DATE(CONCAT(YEAR(target_date), '-01-01'), '%Y-%m-%d'),
+                STR_TO_DATE(CONCAT(YEAR(target_date), '-12-31'), '%Y-%m-%d')
+            );
+        ELSEIF target_date < min_existing THEN
+            CALL sp_populate_dim_date(target_date, DATE_SUB(min_existing, INTERVAL 1 DAY));
+        ELSEIF target_date > max_existing THEN
+            CALL sp_populate_dim_date(DATE_ADD(max_existing, INTERVAL 1 DAY), target_date);
+        END IF;
+    END IF;
+END$$
+DELIMITER ;
+
+-- Populate baseline calendar for Aura's historical range (2023-01-01 through 2026-12-31)
+CALL sp_populate_dim_date('2023-01-01', '2026-12-31');

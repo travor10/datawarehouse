@@ -392,10 +392,62 @@ class TestDatabaseSchema(unittest.TestCase):
 
         # Verify _schema_migrations record
         cursor = test_conn.cursor()
-        cursor.execute("SELECT version, status FROM _schema_migrations WHERE version = '001_initial_schema';")
+        cursor.execute("SELECT version, status, checksum FROM _schema_migrations WHERE version = '001_initial_schema';")
         row = cursor.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "SUCCESS")
+        self.assertEqual(len(row["checksum"]), 64, "Expected valid 64-character SHA-256 digest")
+        test_conn.close()
+
+    def test_10_migration_checksum_violation_detection(self):
+        """Verifies that altering an already-applied migration file raises MigrationChecksumError."""
+        from config.database import MigrationChecksumError
+
+        test_conn = sqlite3.connect(":memory:")
+        test_conn.row_factory = sqlite3.Row
+        test_conn.execute("PRAGMA foreign_keys = ON;")
+
+        # Apply migration initially
+        self.db_manager.run_migrations(conn=test_conn)
+
+        # Corrupt the recorded checksum in the database to simulate file modification
+        cursor = test_conn.cursor()
+        cursor.execute(
+            "UPDATE _schema_migrations SET checksum = 'corrupted_fake_hash_0000000000000000000000000000000000000000000' "
+            "WHERE version = '001_initial_schema';"
+        )
+        test_conn.commit()
+
+        # Re-running migrations must detect the checksum violation and abort
+        with self.assertRaises(MigrationChecksumError):
+            self.db_manager.run_migrations(conn=test_conn)
+
+        test_conn.close()
+
+    def test_11_migration_failure_handling(self):
+        """Verifies that a failing migration statement raises MigrationExecutionError and is not marked SUCCESS."""
+        import tempfile
+        from config.database import MigrationExecutionError
+
+        test_conn = sqlite3.connect(":memory:")
+        test_conn.row_factory = sqlite3.Row
+        test_conn.execute("PRAGMA foreign_keys = ON;")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            # Create a broken migration script with a deliberate syntax error
+            bad_migration = tmp_path / "999_invalid_syntax.sql"
+            bad_migration.write_text("SELECT * FROM FROM WHERE ; INVALID_SQL_SYNTAX_FAIL ;")
+
+            with self.assertRaises(MigrationExecutionError):
+                self.db_manager.run_migrations(migrations_dir=tmp_path, conn=test_conn)
+
+            # Confirm that '999_invalid_syntax' was NOT recorded as SUCCESS
+            cursor = test_conn.cursor()
+            cursor.execute("SELECT status FROM _schema_migrations WHERE version = '999_invalid_syntax';")
+            row = cursor.fetchone()
+            self.assertTrue(row is None or row["status"] != "SUCCESS", "Failed migration must never be marked as SUCCESS")
+
         test_conn.close()
 
 

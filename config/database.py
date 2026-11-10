@@ -9,14 +9,16 @@ Strict Engine Policy:
 - SQLite is used ONLY when explicitly requested (e.g. DB_ENGINE='sqlite' or test suites).
 - Silent driver or engine fallbacks are strictly prohibited.
 - Script execution strips client-only DELIMITER directives and executes statements individually.
+- Migrations are tracked with cryptographic SHA-256 checksums to enforce forward-only immutability.
 """
 
+import hashlib
 import logging
 import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import (
     DATABASE_DIR,
@@ -37,10 +39,20 @@ class ConfigurationError(Exception):
     pass
 
 
+class MigrationChecksumError(Exception):
+    """Raised when an already applied migration file has been altered or tampered with."""
+    pass
+
+
+class MigrationExecutionError(Exception):
+    """Raised when a schema migration statement fails execution."""
+    pass
+
+
 class DatabaseManager:
     """
     Manages database connections, transactions, schema script executions,
-    and migrations for MySQL 8 (Authoritative) and isolated SQLite test databases.
+    and checksum-verified migrations for MySQL 8 (Authoritative) and isolated SQLite test databases.
     """
 
     def __init__(self, engine_type: Optional[str] = None):
@@ -140,7 +152,6 @@ class DatabaseManager:
             conn = sqlite3.connect(str(SQLITE_DB_PATH))
 
         conn.row_factory = sqlite3.Row
-        # Enforce foreign key constraints in SQLite
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
 
@@ -176,6 +187,15 @@ class DatabaseManager:
             return {"status": "error", "engine": self.engine_type, "error": str(e)}
 
     @staticmethod
+    def compute_file_checksum(filepath: Path) -> str:
+        """Computes the SHA-256 cryptographic digest of a migration file."""
+        sha256 = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    @staticmethod
     def parse_mysql_statements(content: str) -> List[str]:
         """
         Parses multi-statement MySQL script content safely:
@@ -184,7 +204,6 @@ class DatabaseManager:
         - Strips client-only DELIMITER commands so they are never sent to MySQL server.
         - Extracts complete stored procedure definitions without splitting internal semicolons.
         """
-        # Remove line comments
         cleaned = re.sub(r"--.*?$", "", content, flags=re.MULTILINE)
 
         statements = []
@@ -196,7 +215,6 @@ class DatabaseManager:
             if not stripped:
                 continue
 
-            # Check for DELIMITER change directive
             delim_match = re.match(r"^DELIMITER\s+(.+)$", stripped, flags=re.IGNORECASE)
             if delim_match:
                 delimiter = delim_match.group(1).strip()
@@ -227,7 +245,6 @@ class DatabaseManager:
         """
         cleaned = re.sub(r"--.*?$", "", sql_text, flags=re.MULTILINE)
 
-        # Remove MySQL-specific commands
         cleaned = re.sub(r"USE\s+[a-zA-Z0-9_]+;", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"SET\s+FOREIGN_KEY_CHECKS\s*=\s*[01];", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"DELIMITER\s+.*", "", cleaned)
@@ -235,11 +252,12 @@ class DatabaseManager:
         cleaned = re.sub(r"ON\s+DUPLICATE\s+KEY\s+UPDATE.*?(?=;|$)", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
         cleaned = re.sub(r"CALL\s+sp_populate_dim_date\(.*?\);?", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"CALL\s+sp_extend_dim_date\(.*?\);?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"DROP\s+PROCEDURE\s+(?:IF\s+EXISTS\s+)?[a-zA-Z0-9_]+;?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"CREATE\s+PROCEDURE\s+.*?\bEND(?:\$\$|;)", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
         cleaned = re.sub(r"ENGINE\s*=\s*InnoDB.*?;", ";", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"DEFAULT\s+CHARSET\s*=\s*[a-zA-Z0-9_]+", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"COLLATE\s*=\s*[a-zA-Z0-9_]+", "", cleaned, flags=re.IGNORECASE)
 
-        # Handle AUTO_INCREMENT columns for SQLite
         auto_cols = re.findall(
             r"(\b[a-zA-Z0-9_]+_key\b)\s+(?:BIGINT|INT)\s+AUTO_INCREMENT\s+NOT\s+NULL",
             cleaned,
@@ -259,7 +277,6 @@ class DatabaseManager:
                 flags=re.IGNORECASE,
             )
 
-        # In SQLite, remove inline ', INDEX ...' from CREATE TABLE and convert to standalone CREATE INDEX
         standalone_indexes = []
         for match in re.finditer(
             r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s*\((.*?)\);",
@@ -280,7 +297,6 @@ class DatabaseManager:
             r",\s*INDEX\s+[a-zA-Z0-9_]+\s*\(.*?\)", "", cleaned, flags=re.IGNORECASE
         )
 
-        # Adjust MySQL types to SQLite affinities
         cleaned = re.sub(r"\bTINYINT\s+UNSIGNED\b", "INTEGER", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bSMALLINT\s+UNSIGNED\b", "INTEGER", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bTINYINT\b", "INTEGER", cleaned, flags=re.IGNORECASE)
@@ -293,7 +309,7 @@ class DatabaseManager:
 
         return cleaned
 
-    def execute_script(self, script_path, conn=None):
+    def execute_script(self, script_path: Path, conn=None):
         """
         Executes a SQL file safely:
         - In SQLite: Adapts syntax, strips MySQL specifics, executes individual statements.
@@ -315,37 +331,38 @@ class DatabaseManager:
                 statements = [
                     s.strip()
                     for s in adapted_sql.split(";")
-                    if s.strip() and not s.strip().upper().startswith("CREATE PROCEDURE")
+                    if s.strip()
+                    and not s.strip().upper().startswith("CREATE PROCEDURE")
+                    and not s.strip().upper().startswith("DROP PROCEDURE")
                 ]
                 for stmt in statements:
                     try:
                         cursor.execute(stmt)
                     except Exception as stmt_err:
-                        if "already exists" not in str(stmt_err).lower() and "no such table" not in str(stmt_err).lower():
-                            logger.debug(f"Statement execution notice: {stmt_err}")
+                        err_msg = str(stmt_err).lower()
+                        if stmt.upper().startswith("DROP ") and "no such" in err_msg:
+                            continue
+                        logger.error(f"Error executing SQLite statement in {script_path.name}: {stmt_err}\nQuery: {stmt[:150]}")
+                        raise MigrationExecutionError(f"Failed statement in {script_path.name}: {stmt_err}") from stmt_err
                 conn.commit()
             else:
-                # MySQL multi-statement and stored procedure execution
                 statements = self.parse_mysql_statements(content)
                 for stmt in statements:
                     stmt_clean = stmt.strip()
-                    if not stmt_clean:
-                        continue
-                    # Ignore USE database if already connected
-                    if stmt_clean.upper().startswith("USE "):
+                    if not stmt_clean or stmt_clean.upper().startswith("USE "):
                         continue
                     try:
                         cursor.execute(stmt_clean)
                     except Exception as err:
                         logger.error(f"Error executing statement in {script_path}: {err}\nQuery: {stmt_clean[:150]}")
-                        raise
+                        raise MigrationExecutionError(f"Failed statement in {script_path.name}: {err}") from err
                 conn.commit()
         finally:
             if close_at_end:
                 conn.close()
 
     def init_migration_table(self, conn=None):
-        """Initializes the schema migration tracking table if not present."""
+        """Initializes the schema migration tracking table with checksum tracking."""
         close_at_end = False
         if conn is None:
             conn = self.get_connection()
@@ -358,6 +375,7 @@ class DatabaseManager:
                 migration_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 version VARCHAR(50) NOT NULL UNIQUE,
                 description VARCHAR(255) NOT NULL,
+                checksum VARCHAR(64) NOT NULL,
                 applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 execution_time_ms INTEGER NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS'
@@ -369,6 +387,7 @@ class DatabaseManager:
                 migration_id INT AUTO_INCREMENT PRIMARY KEY,
                 version VARCHAR(50) NOT NULL UNIQUE,
                 description VARCHAR(255) NOT NULL,
+                checksum VARCHAR(64) NOT NULL,
                 applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 execution_time_ms INT NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS'
@@ -380,8 +399,13 @@ class DatabaseManager:
 
     def run_migrations(self, migrations_dir: Optional[Path] = None, conn=None) -> List[str]:
         """
-        Executes pending forward schema migrations in alphanumeric order.
-        Ensures idempotent, non-destructive schema evolution.
+        Executes pending forward schema migrations in alphanumeric order with SHA-256 checksum protection.
+        
+        Failure Policy:
+        - If a previously applied migration file has been altered, raises MigrationChecksumError and aborts.
+        - If a migration statement fails, the migration is NOT recorded as successful.
+        - In SQLite, the transaction is rolled back. In MySQL, note that MySQL DDL statements invoke
+          implicit commits and cannot be rolled back transactionally.
         """
         mgr_dir = migrations_dir or (DATABASE_DIR / "migrations")
         if not mgr_dir.exists():
@@ -395,32 +419,73 @@ class DatabaseManager:
         self.init_migration_table(conn=conn)
         cursor = conn.cursor()
 
-        # Get already applied migrations
-        cursor.execute("SELECT version FROM _schema_migrations;")
-        applied = {row["version"] if isinstance(row, dict) else row[0] for row in cursor.fetchall()}
+        # Step 1: Query already applied migrations and their recorded checksums
+        cursor.execute("SELECT version, checksum FROM _schema_migrations WHERE status = 'SUCCESS';")
+        applied_records = {
+            (row["version"] if isinstance(row, dict) else row[0]): (row["checksum"] if isinstance(row, dict) else row[1])
+            for row in cursor.fetchall()
+        }
 
-        applied_this_run = []
         migration_files = sorted(mgr_dir.glob("*.sql"))
 
+        # Step 2: Cryptographic Checksum Integrity Check on all previously applied migrations
         for m_file in migration_files:
             version = m_file.stem
-            if version in applied or version.startswith("_"):
+            if version in applied_records:
+                current_checksum = self.compute_file_checksum(m_file)
+                recorded_checksum = applied_records[version]
+                if current_checksum != recorded_checksum:
+                    raise MigrationChecksumError(
+                        f"CRITICAL: Schema Migration Checksum Violation!\n"
+                        f"Migration '{version}' ({m_file.name}) was already applied to the database, "
+                        f"but the file contents have been modified.\n"
+                        f"Expected SHA-256: {recorded_checksum}\n"
+                        f"Calculated SHA-256: {current_checksum}\n"
+                        f"Data warehouse migrations are strictly immutable and forward-only. "
+                        f"Revert '{m_file.name}' or apply a new forward migration script."
+                    )
+
+        # Step 3: Apply pending migrations
+        applied_this_run = []
+        for m_file in migration_files:
+            version = m_file.stem
+            if version in applied_records or version.startswith("_"):
                 continue
 
-            logger.info(f"Applying schema migration: {version} ({m_file.name})")
+            file_checksum = self.compute_file_checksum(m_file)
+            logger.info(f"Applying schema migration: {version} ({m_file.name}) [SHA-256: {file_checksum[:8]}...]")
             t0 = time.time()
-            self.execute_script(m_file, conn=conn)
-            elapsed_ms = int((time.time() - t0) * 1000)
 
-            cursor.execute(
-                "INSERT INTO _schema_migrations (version, description, execution_time_ms, status) "
-                "VALUES (?, ?, ?, 'SUCCESS');" if self.engine_type == "sqlite" else
-                "INSERT INTO _schema_migrations (version, description, execution_time_ms, status) "
-                "VALUES (%s, %s, %s, 'SUCCESS');",
-                (version, f"Applied from {m_file.name}", elapsed_ms),
-            )
-            conn.commit()
-            applied_this_run.append(version)
+            try:
+                self.execute_script(m_file, conn=conn)
+                elapsed_ms = int((time.time() - t0) * 1000)
+
+                cursor.execute(
+                    "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
+                    "VALUES (?, ?, ?, ?, 'SUCCESS');" if self.engine_type == "sqlite" else
+                    "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
+                    "VALUES (%s, %s, %s, %s, 'SUCCESS');",
+                    (version, f"Applied from {m_file.name}", file_checksum, elapsed_ms),
+                )
+                conn.commit()
+                applied_this_run.append(version)
+            except Exception as e:
+                if self.engine_type == "sqlite":
+                    conn.rollback()
+                logger.error(f"Migration {version} failed: {e}")
+                # Record failure record if possible
+                try:
+                    cursor.execute(
+                        "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
+                        "VALUES (?, ?, ?, 0, 'FAILED');" if self.engine_type == "sqlite" else
+                        "INSERT INTO _schema_migrations (version, description, checksum, execution_time_ms, status) "
+                        "VALUES (%s, %s, %s, 0, 'FAILED');",
+                        (version, f"FAILED: {str(e)[:200]}", file_checksum),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+                raise MigrationExecutionError(f"Migration '{version}' failed: {e}") from e
 
         if close_at_end:
             conn.close()
