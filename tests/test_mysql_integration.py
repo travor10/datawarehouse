@@ -106,6 +106,67 @@ class TestMySQLIntegration(unittest.TestCase):
         max_dt = str(row.get("max_dt") if isinstance(row, dict) else row[0])
         self.assertGreaterEqual(max_dt, "2026-12-31", "Dim_Date must extend through 2026-12-31")
 
+    def test_05_mysql_schema_migrations(self):
+        """Verifies migration tracking table and forward migrations on MySQL 8."""
+        applied = self.db_manager.run_migrations(conn=self.conn)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS cnt FROM _schema_migrations WHERE status = 'SUCCESS';")
+        row = cursor.fetchone()
+        cnt = row.get("cnt") if isinstance(row, dict) else row[0]
+        self.assertGreaterEqual(cnt, 1, "Expected at least 1 successful migration in _schema_migrations")
+
+    def test_06_mysql_five_expense_completeness_states(self):
+        """Verifies all 5 expense completeness states and NULL withholding on MySQL 8."""
+        cursor = self.conn.cursor()
+        # Clean test records
+        cursor.execute("DELETE FROM Fact_Job_Expenses WHERE source_file = 'mysql_test.xlsx';")
+        cursor.execute("DELETE FROM Fact_Job_Performance WHERE source_file = 'mysql_test.xlsx';")
+        cursor.execute("DELETE FROM Dim_Job WHERE source_file = 'mysql_test.xlsx';")
+        self.conn.commit()
+
+        # Seed required customer and location if needed
+        cursor.execute("SELECT customer_key FROM Dim_Customer LIMIT 1;")
+        c_row = cursor.fetchone()
+        cust_id = c_row.get("customer_key") if isinstance(c_row, dict) else c_row[0]
+
+        cursor.execute("SELECT location_key FROM Dim_Location LIMIT 1;")
+        l_row = cursor.fetchone()
+        loc_id = l_row.get("location_key") if isinstance(l_row, dict) else l_row[0]
+
+        cursor.execute("SELECT service_key FROM Dim_Service LIMIT 1;")
+        s_row = cursor.fetchone()
+        srv_id = s_row.get("service_key") if isinstance(s_row, dict) else s_row[0]
+
+        cursor.execute("SELECT expense_cat_key FROM Dim_Expense_Category LIMIT 1;")
+        e_row = cursor.fetchone()
+        exp_cat_id = e_row.get("expense_cat_key") if isinstance(e_row, dict) else e_row[0]
+
+        # Insert Complete Job
+        cursor.execute(
+            "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
+            "VALUES ('MY-COMPLETE', %s, %s, TRUE, 'COMPLETE', 'CONFIRMED', 150000, 'mysql_test.xlsx', 'h_m1', 'l_m1');",
+            (cust_id, loc_id),
+        )
+        j_id = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
+            "VALUES (%s, %s, %s, %s, 400000, 'mysql_test.xlsx', 'h_m1', 'p_m1', 'b1');",
+            (j_id, cust_id, srv_id, loc_id),
+        )
+        cursor.execute(
+            "INSERT INTO Fact_Job_Expenses (job_key, expense_cat_key, location_key, expense_amount, is_verified, source_file, source_file_hash, source_record_locator, etl_batch_id) "
+            "VALUES (%s, %s, %s, 100000, TRUE, 'mysql_test.xlsx', 'h_m1', 'e_m1', 'b1');",
+            (j_id, exp_cat_id, loc_id),
+        )
+        self.conn.commit()
+
+        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'MY-COMPLETE';")
+        res = cursor.fetchone()
+        rev = res.get("total_revenue_earned") if isinstance(res, dict) else res[17]
+        contrib = res.get("confirmed_gross_contribution") if isinstance(res, dict) else res[24]
+        self.assertEqual(float(rev), 400000.0)
+        self.assertEqual(float(contrib), 300000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

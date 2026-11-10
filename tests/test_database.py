@@ -1,8 +1,9 @@
 """
-Aura Cleaning Solutions Data Mart - Database & Schema Verification Tests
+Aura Cleaning Solutions Data Mart - [OFFLINE / LOCAL] SQLite Relational Unit Test Suite
 =============================================================================
 Tests dimensional schema creation, primary/foreign key integrity, source-record
-SHA-256 idempotency constraints, strict null preservation, and reporting view accuracy.
+SHA-256 idempotency constraints, strict null preservation, the 5 expense completeness
+states, and schema migration tracking.
 
 Runs on Python's built-in unittest framework using SQLite in-memory / local mode,
 ensuring zero external pip dependency blockers while enforcing identical relational
@@ -197,13 +198,15 @@ class TestDatabaseSchema(unittest.TestCase):
         self.assertIsNone(row["quoted_amount"], "Missing quoted amount must be NULL!")
         self.assertIsNone(row["revenue_earned"], "Missing revenue earned must be NULL!")
 
-    def test_07_job_profitability_view_completeness_and_null_withholding(self):
+    def test_07_five_expense_completeness_states(self):
         """
-        Critical Financial Safeguard:
-        1. When expenses are missing entirely, total_verified_expenses must be NULL (not 0.00).
-        2. When expenses are INCOMPLETE, confirmed_gross_contribution must be NULL.
-        3. When expenses are COMPLETE and CONFIRMED, contribution and margin calculate accurately.
-        4. When figures are incomplete, profit variance discrepancy is withheld (NULL).
+        Rigorous Financial Integrity Test:
+        Verifies the exact behavior of vw_job_profitability_summary across all 5 states:
+        1. COMPLETE: Revenue & all verified expenses complete -> contribution calculated, variance calculated.
+        2. CONFIRMED_ZERO: Work confirmed with 0 expenses -> verified costs = 0.00, contribution = revenue.
+        3. UNKNOWN: Expense status undetermined -> verified costs = NULL, contribution = NULL, variance = NULL.
+        4. INCOMPLETE: Some vouchers present but others missing -> verified costs displayed, contribution = NULL, variance = NULL.
+        5. UNVERIFIED: Vouchers recorded but receipts unverified -> verified costs = 0, unverified costs > 0, contribution = NULL.
         """
         cursor = self.conn.cursor()
 
@@ -217,98 +220,137 @@ class TestDatabaseSchema(unittest.TestCase):
         cursor.execute("INSERT INTO Dim_Expense_Category (expense_category_name, cost_type) VALUES ('Labour Wages', 'Direct Operational Cost');")
         exp_cat_id = cursor.lastrowid
 
-        # Case A: Job with MISSING Expenses (No expense rows loaded yet)
+        # -------------------------------------------------------------
+        # State 1: COMPLETE (Fully verified and confirmed)
+        # -------------------------------------------------------------
         cursor.execute(
             "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
-            "VALUES ('AUR-NO-EXP', ?, ?, 1, 'UNKNOWN', 'UNDETERMINED', 100000, 'rep_no_exp.xlsx', 'h_a', 'loc_a');",
+            "VALUES ('JOB-COMPLETE', ?, ?, 1, 'COMPLETE', 'CONFIRMED', 180000, 'f1.xlsx', 'h1', 'l1');",
             (cust_id, loc_id),
         )
-        job_no_exp_id = cursor.lastrowid
+        j1 = cursor.lastrowid
         cursor.execute(
             "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
-            "VALUES (?, ?, ?, ?, 200000, 'no_exp.xlsx', 'h_p1', 'l_p1', 'b1');",
-            (job_no_exp_id, cust_id, srv_id, loc_id),
-        )
-
-        # Case B: Incomplete Expenses Job (Expenses exist but flagged INCOMPLETE)
-        cursor.execute(
-            "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
-            "VALUES ('AUR-INC', ?, ?, 1, 'INCOMPLETE', 'PROVISIONAL_INCOMPLETE_COSTS', 120000, 'rep_inc.xlsx', 'h_b', 'loc_b');",
-            (cust_id, loc_id),
-        )
-        job_inc_id = cursor.lastrowid
-        cursor.execute(
-            "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
-            "VALUES (?, ?, ?, ?, 300000, 'inc.xlsx', 'h_p2', 'l_p2', 'b1');",
-            (job_inc_id, cust_id, srv_id, loc_id),
+            "VALUES (?, ?, ?, ?, 500000, 'f1.xlsx', 'h1', 'p1', 'b1');",
+            (j1, cust_id, srv_id, loc_id),
         )
         cursor.execute(
             "INSERT INTO Fact_Job_Expenses (job_key, expense_cat_key, location_key, expense_amount, is_verified, source_file, source_file_hash, source_record_locator, etl_batch_id) "
-            "VALUES (?, ?, ?, 50000, 1, 'inc.xlsx', 'h_e1', 'l_e1', 'b1');",
-            (job_inc_id, exp_cat_id, loc_id),
+            "VALUES (?, ?, ?, 120000, 1, 'f1.xlsx', 'h1', 'e1', 'b1');",
+            (j1, exp_cat_id, loc_id),
         )
 
-        # Case C: Fully Complete and Confirmed Job
+        # -------------------------------------------------------------
+        # State 2: CONFIRMED_ZERO (Confirmed zero direct cost)
+        # -------------------------------------------------------------
         cursor.execute(
             "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
-            "VALUES ('AUR-CONF', ?, ?, 1, 'COMPLETE', 'CONFIRMED', 180000, 'rep_conf.xlsx', 'h_c', 'loc_c');",
+            "VALUES ('JOB-ZERO', ?, ?, 1, 'CONFIRMED_ZERO', 'CONFIRMED', 200000, 'f2.xlsx', 'h2', 'l2');",
             (cust_id, loc_id),
         )
-        job_conf_id = cursor.lastrowid
+        j2 = cursor.lastrowid
         cursor.execute(
             "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
-            "VALUES (?, ?, ?, ?, 500000, 'conf.xlsx', 'h_p3', 'l_p3', 'b1');",
-            (job_conf_id, cust_id, srv_id, loc_id),
+            "VALUES (?, ?, ?, ?, 200000, 'f2.xlsx', 'h2', 'p2', 'b1');",
+            (j2, cust_id, srv_id, loc_id),
+        )
+
+        # -------------------------------------------------------------
+        # State 3: UNKNOWN (No expense data recorded yet)
+        # -------------------------------------------------------------
+        cursor.execute(
+            "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
+            "VALUES ('JOB-UNKNOWN', ?, ?, 1, 'UNKNOWN', 'UNDETERMINED', 100000, 'f3.xlsx', 'h3', 'l3');",
+            (cust_id, loc_id),
+        )
+        j3 = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
+            "VALUES (?, ?, ?, ?, 350000, 'f3.xlsx', 'h3', 'p3', 'b1');",
+            (j3, cust_id, srv_id, loc_id),
+        )
+
+        # -------------------------------------------------------------
+        # State 4: INCOMPLETE (Some expenses recorded, but known vouchers missing)
+        # -------------------------------------------------------------
+        cursor.execute(
+            "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
+            "VALUES ('JOB-INCOMPLETE', ?, ?, 1, 'INCOMPLETE', 'PROVISIONAL_INCOMPLETE_COSTS', 150000, 'f4.xlsx', 'h4', 'l4');",
+            (cust_id, loc_id),
+        )
+        j4 = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
+            "VALUES (?, ?, ?, ?, 400000, 'f4.xlsx', 'h4', 'p4', 'b1');",
+            (j4, cust_id, srv_id, loc_id),
         )
         cursor.execute(
             "INSERT INTO Fact_Job_Expenses (job_key, expense_cat_key, location_key, expense_amount, is_verified, source_file, source_file_hash, source_record_locator, etl_batch_id) "
-            "VALUES (?, ?, ?, 120000, 1, 'conf.xlsx', 'h_e2', 'l_e2', 'b1');",
-            (job_conf_id, exp_cat_id, loc_id),
+            "VALUES (?, ?, ?, 60000, 1, 'f4.xlsx', 'h4', 'e4', 'b1');",
+            (j4, exp_cat_id, loc_id),
+        )
+
+        # -------------------------------------------------------------
+        # State 5: UNVERIFIED (Vouchers exist but receipts are unverified)
+        # -------------------------------------------------------------
+        cursor.execute(
+            "INSERT INTO Dim_Job (job_reference, customer_key, location_key, is_revenue_complete, expense_completeness_status, profitability_status, reported_job_profit, source_file, source_file_hash, source_record_locator) "
+            "VALUES ('JOB-UNVERIFIED', ?, ?, 1, 'UNVERIFIED', 'UNDETERMINED', 80000, 'f5.xlsx', 'h5', 'l5');",
+            (cust_id, loc_id),
+        )
+        j5 = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO Fact_Job_Performance (job_key, customer_key, service_key, location_key, revenue_earned, source_file, source_file_hash, source_record_locator, etl_batch_id) "
+            "VALUES (?, ?, ?, ?, 300000, 'f5.xlsx', 'h5', 'p5', 'b1');",
+            (j5, cust_id, srv_id, loc_id),
+        )
+        cursor.execute(
+            "INSERT INTO Fact_Job_Expenses (job_key, expense_cat_key, location_key, expense_amount, is_verified, source_file, source_file_hash, source_record_locator, etl_batch_id) "
+            "VALUES (?, ?, ?, 70000, 0, 'f5.xlsx', 'h5', 'e5', 'b1');",
+            (j5, exp_cat_id, loc_id),
         )
         self.conn.commit()
 
-        # Query Case A: Missing expenses
-        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'AUR-NO-EXP';")
-        no_exp_row = cursor.fetchone()
-        self.assertIsNone(
-            no_exp_row["total_verified_expenses"],
-            "Missing expense records must return NULL, never 0.00!",
-        )
-        self.assertIsNone(
-            no_exp_row["confirmed_gross_contribution"],
-            "Confirmed contribution must be NULL when expenses are unknown!",
-        )
-        self.assertIsNone(
-            no_exp_row["profit_variance_discrepancy"],
-            "Profit variance discrepancy must be withheld (NULL) when expenses are unknown!",
-        )
+        # Query and assert State 1: COMPLETE
+        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'JOB-COMPLETE';")
+        r1 = cursor.fetchone()
+        self.assertEqual(r1["total_revenue_earned"], 500000)
+        self.assertEqual(r1["total_verified_expenses"], 120000)
+        self.assertEqual(r1["confirmed_gross_contribution"], 380000)
+        self.assertEqual(r1["confirmed_gross_margin_pct"], 76.0)
+        self.assertEqual(r1["profit_variance_discrepancy"], -200000)
 
-        # Query Case B: Incomplete expenses
-        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'AUR-INC';")
-        inc_row = cursor.fetchone()
-        self.assertEqual(inc_row["total_revenue_earned"], 300000)
-        self.assertEqual(inc_row["total_verified_expenses"], 50000)
-        self.assertEqual(inc_row["provisional_gross_contribution"], 250000)
-        self.assertIsNone(
-            inc_row["confirmed_gross_contribution"],
-            "Confirmed contribution must be NULL when expense completeness is not COMPLETE!",
-        )
-        self.assertIsNone(
-            inc_row["profit_variance_discrepancy"],
-            "Profit variance discrepancy must be withheld when expenses are incomplete!",
-        )
+        # Query and assert State 2: CONFIRMED_ZERO
+        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'JOB-ZERO';")
+        r2 = cursor.fetchone()
+        self.assertEqual(r2["total_revenue_earned"], 200000)
+        self.assertEqual(r2["total_verified_expenses"], 0.0)
+        self.assertEqual(r2["confirmed_gross_contribution"], 200000)
+        self.assertEqual(r2["confirmed_gross_margin_pct"], 100.0)
+        self.assertEqual(r2["profit_variance_discrepancy"], 0.0)
 
-        # Query Case C: Fully confirmed and complete
-        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'AUR-CONF';")
-        conf_row = cursor.fetchone()
-        self.assertEqual(conf_row["total_revenue_earned"], 500000)
-        self.assertEqual(conf_row["total_verified_expenses"], 120000)
-        # Confirmed contribution: 500,000 - 120,000 = 380,000
-        self.assertEqual(conf_row["confirmed_gross_contribution"], 380000)
-        # Margin: (380,000 / 500,000) * 100 = 76%
-        self.assertEqual(conf_row["confirmed_gross_margin_pct"], 76.0)
-        # Variance discrepancy: Reported profit (180,000) - Calculated contribution (380,000) = -200,000
-        self.assertEqual(conf_row["profit_variance_discrepancy"], -200000)
+        # Query and assert State 3: UNKNOWN
+        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'JOB-UNKNOWN';")
+        r3 = cursor.fetchone()
+        self.assertEqual(r3["total_revenue_earned"], 350000)
+        self.assertIsNone(r3["total_verified_expenses"], "UNKNOWN expenses must be NULL")
+        self.assertIsNone(r3["confirmed_gross_contribution"], "Contribution must be NULL when expenses unknown")
+        self.assertIsNone(r3["profit_variance_discrepancy"], "Variance must be withheld when expenses unknown")
+
+        # Query and assert State 4: INCOMPLETE
+        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'JOB-INCOMPLETE';")
+        r4 = cursor.fetchone()
+        self.assertEqual(r4["total_verified_expenses"], 60000)
+        self.assertIsNone(r4["confirmed_gross_contribution"], "Contribution must be NULL when expenses incomplete")
+        self.assertIsNone(r4["profit_variance_discrepancy"], "Variance must be withheld when expenses incomplete")
+
+        # Query and assert State 5: UNVERIFIED
+        cursor.execute("SELECT * FROM vw_job_profitability_summary WHERE job_reference = 'JOB-UNVERIFIED';")
+        r5 = cursor.fetchone()
+        self.assertEqual(r5["total_verified_expenses"], 0.0)
+        self.assertEqual(r5["total_unverified_expenses"], 70000)
+        self.assertIsNone(r5["confirmed_gross_contribution"], "Contribution must be NULL when unverified")
+        self.assertIsNone(r5["profit_variance_discrepancy"], "Variance must be withheld when unverified")
 
     def test_08_reference_data_seeding(self):
         """Verifies that reference data insertion scripts correctly seed canonical dimensions."""
@@ -332,6 +374,29 @@ class TestDatabaseSchema(unittest.TestCase):
             "Laundry Services",
         }
         self.assertEqual(categories, expected_categories, "All 7 canonical service categories must be seeded.")
+
+    def test_09_migration_runner_idempotency(self):
+        """Verifies that run_migrations tracks applied versions in _schema_migrations."""
+        # Create a fresh isolated connection
+        test_conn = sqlite3.connect(":memory:")
+        test_conn.row_factory = sqlite3.Row
+        test_conn.execute("PRAGMA foreign_keys = ON;")
+
+        # Run migrations first time
+        applied_1 = self.db_manager.run_migrations(conn=test_conn)
+        self.assertIn("001_initial_schema", applied_1, "001_initial_schema should be applied on first run")
+
+        # Run migrations second time (must be idempotent no-op)
+        applied_2 = self.db_manager.run_migrations(conn=test_conn)
+        self.assertEqual(len(applied_2), 0, "Second migration run must be a no-op")
+
+        # Verify _schema_migrations record
+        cursor = test_conn.cursor()
+        cursor.execute("SELECT version, status FROM _schema_migrations WHERE version = '001_initial_schema';")
+        row = cursor.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "SUCCESS")
+        test_conn.close()
 
 
 if __name__ == "__main__":

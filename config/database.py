@@ -8,12 +8,15 @@ Strict Engine Policy:
 - If DB_ENGINE='mysql', MySQL drivers and connectivity are strictly required.
 - SQLite is used ONLY when explicitly requested (e.g. DB_ENGINE='sqlite' or test suites).
 - Silent driver or engine fallbacks are strictly prohibited.
+- Script execution strips client-only DELIMITER directives and executes statements individually.
 """
 
 import logging
 import re
 import sqlite3
-from typing import Any, Dict, Optional
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from config.settings import (
     DATABASE_DIR,
@@ -36,8 +39,8 @@ class ConfigurationError(Exception):
 
 class DatabaseManager:
     """
-    Manages database connections, transactions, and schema script executions
-    for MySQL 8 (Authoritative) and isolated SQLite test databases.
+    Manages database connections, transactions, schema script executions,
+    and migrations for MySQL 8 (Authoritative) and isolated SQLite test databases.
     """
 
     def __init__(self, engine_type: Optional[str] = None):
@@ -173,13 +176,55 @@ class DatabaseManager:
             return {"status": "error", "engine": self.engine_type, "error": str(e)}
 
     @staticmethod
+    def parse_mysql_statements(content: str) -> List[str]:
+        """
+        Parses multi-statement MySQL script content safely:
+        - Strips comment lines.
+        - Dynamically tracks DELIMITER directives (e.g. DELIMITER $$ ... DELIMITER ;).
+        - Strips client-only DELIMITER commands so they are never sent to MySQL server.
+        - Extracts complete stored procedure definitions without splitting internal semicolons.
+        """
+        # Remove line comments
+        cleaned = re.sub(r"--.*?$", "", content, flags=re.MULTILINE)
+
+        statements = []
+        delimiter = ";"
+        current_stmt: List[str] = []
+
+        for line in cleaned.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Check for DELIMITER change directive
+            delim_match = re.match(r"^DELIMITER\s+(.+)$", stripped, flags=re.IGNORECASE)
+            if delim_match:
+                delimiter = delim_match.group(1).strip()
+                continue
+
+            current_stmt.append(line)
+            joined = "\n".join(current_stmt).strip()
+
+            if joined.endswith(delimiter):
+                stmt = joined[:-len(delimiter)].strip()
+                if stmt:
+                    statements.append(stmt)
+                current_stmt = []
+
+        if current_stmt:
+            remaining = "\n".join(current_stmt).strip()
+            if remaining:
+                statements.append(remaining)
+
+        return statements
+
+    @staticmethod
     def adapt_mysql_ddl_for_sqlite(sql_text: str) -> str:
         """
         Adapts standard MySQL 8 DDL scripts into SQLite dialect for unit tests.
         Converts AUTO_INCREMENT, ENGINES, CHARACTER SETS, and data types while
         preserving relational foreign key constraints and check constraints.
         """
-        # Strip line comments first so statements are clean
         cleaned = re.sub(r"--.*?$", "", sql_text, flags=re.MULTILINE)
 
         # Remove MySQL-specific commands
@@ -249,7 +294,12 @@ class DatabaseManager:
         return cleaned
 
     def execute_script(self, script_path, conn=None):
-        """Executes a SQL file against the current connection."""
+        """
+        Executes a SQL file safely:
+        - In SQLite: Adapts syntax, strips MySQL specifics, executes individual statements.
+        - In MySQL: Parses individual statements, strips DELIMITER client directives,
+                    and executes each statement (including CREATE PROCEDURE) reliably.
+        """
         close_at_end = False
         if conn is None:
             conn = self.get_connection()
@@ -271,20 +321,112 @@ class DatabaseManager:
                     try:
                         cursor.execute(stmt)
                     except Exception as stmt_err:
-                        # Log but continue for harmless duplicate statements in testing
                         if "already exists" not in str(stmt_err).lower() and "no such table" not in str(stmt_err).lower():
                             logger.debug(f"Statement execution notice: {stmt_err}")
                 conn.commit()
             else:
-                # MySQL multi-statement execution
-                cursor.execute(content)
+                # MySQL multi-statement and stored procedure execution
+                statements = self.parse_mysql_statements(content)
+                for stmt in statements:
+                    stmt_clean = stmt.strip()
+                    if not stmt_clean:
+                        continue
+                    # Ignore USE database if already connected
+                    if stmt_clean.upper().startswith("USE "):
+                        continue
+                    try:
+                        cursor.execute(stmt_clean)
+                    except Exception as err:
+                        logger.error(f"Error executing statement in {script_path}: {err}\nQuery: {stmt_clean[:150]}")
+                        raise
                 conn.commit()
         finally:
             if close_at_end:
                 conn.close()
 
+    def init_migration_table(self, conn=None):
+        """Initializes the schema migration tracking table if not present."""
+        close_at_end = False
+        if conn is None:
+            conn = self.get_connection()
+            close_at_end = True
 
-# Default singleton instance
-# In testing environments without configured MySQL, instantiate DatabaseManager('sqlite') explicitly.
+        cursor = conn.cursor()
+        if self.engine_type == "sqlite":
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS _schema_migrations (
+                migration_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version VARCHAR(50) NOT NULL UNIQUE,
+                description VARCHAR(255) NOT NULL,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                execution_time_ms INTEGER NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS'
+            );
+            """)
+        else:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS _schema_migrations (
+                migration_id INT AUTO_INCREMENT PRIMARY KEY,
+                version VARCHAR(50) NOT NULL UNIQUE,
+                description VARCHAR(255) NOT NULL,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                execution_time_ms INT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            """)
+        conn.commit()
+        if close_at_end:
+            conn.close()
+
+    def run_migrations(self, migrations_dir: Optional[Path] = None, conn=None) -> List[str]:
+        """
+        Executes pending forward schema migrations in alphanumeric order.
+        Ensures idempotent, non-destructive schema evolution.
+        """
+        mgr_dir = migrations_dir or (DATABASE_DIR / "migrations")
+        if not mgr_dir.exists():
+            return []
+
+        close_at_end = False
+        if conn is None:
+            conn = self.get_connection()
+            close_at_end = True
+
+        self.init_migration_table(conn=conn)
+        cursor = conn.cursor()
+
+        # Get already applied migrations
+        cursor.execute("SELECT version FROM _schema_migrations;")
+        applied = {row["version"] if isinstance(row, dict) else row[0] for row in cursor.fetchall()}
+
+        applied_this_run = []
+        migration_files = sorted(mgr_dir.glob("*.sql"))
+
+        for m_file in migration_files:
+            version = m_file.stem
+            if version in applied or version.startswith("_"):
+                continue
+
+            logger.info(f"Applying schema migration: {version} ({m_file.name})")
+            t0 = time.time()
+            self.execute_script(m_file, conn=conn)
+            elapsed_ms = int((time.time() - t0) * 1000)
+
+            cursor.execute(
+                "INSERT INTO _schema_migrations (version, description, execution_time_ms, status) "
+                "VALUES (?, ?, ?, 'SUCCESS');" if self.engine_type == "sqlite" else
+                "INSERT INTO _schema_migrations (version, description, execution_time_ms, status) "
+                "VALUES (%s, %s, %s, 'SUCCESS');",
+                (version, f"Applied from {m_file.name}", elapsed_ms),
+            )
+            conn.commit()
+            applied_this_run.append(version)
+
+        if close_at_end:
+            conn.close()
+
+        return applied_this_run
+
+
 def get_db_manager(engine_type: Optional[str] = None) -> DatabaseManager:
     return DatabaseManager(engine_type=engine_type)
