@@ -2,35 +2,22 @@
 -- Aura Cleaning Solutions Data Mart
 -- Script: create_facts.sql
 -- Target Engine: MySQL 8.0+
--- Description: DDL for the 2 Fact tables adhering to strict grain discipline.
+-- Description: Non-destructive DDL for Fact tables with robust SHA-256 idempotency.
 -- =============================================================================
 
 USE aura_data_mart;
-
-SET FOREIGN_KEY_CHECKS = 0;
-
-DROP TABLE IF EXISTS Fact_Job_Expenses;
-DROP TABLE IF EXISTS Fact_Job_Performance;
-
-SET FOREIGN_KEY_CHECKS = 1;
 
 -- -----------------------------------------------------------------------------
 -- 1. Fact_Job_Performance
 -- -----------------------------------------------------------------------------
 -- Granularity: Exactly one record per service line delivered within a cleaning job.
 --
--- Academic Rationale:
--- Preserves the atomic service revenue transaction. If a job entails two distinct
--- services (e.g. Sofa Cleaning and Carpet Cleaning), each service appears as its
--- own line item with its respective quantity, quoted estimate, and earned revenue.
--- Job-level expenses are strictly EXCLUDED from this table to avoid multi-valued
--- cost duplication.
---
--- Database Safeguard:
--- Composite uniqueness on (source_file, source_row_id) guarantees idempotent
--- ETL processing and prevents duplicate rows if a report is reprocessed.
+-- Robust Idempotency Safeguard:
+-- Composite uniqueness on (source_file_hash, source_record_locator) guarantees that
+-- renaming a source file cannot bypass duplicate detection. The SHA-256 content
+-- hash paired with the exact sheet/page/row locator prevents duplicate records.
 -- -----------------------------------------------------------------------------
-CREATE TABLE Fact_Job_Performance (
+CREATE TABLE IF NOT EXISTS Fact_Job_Performance (
     performance_key BIGINT AUTO_INCREMENT NOT NULL,
     job_key INT NOT NULL,
     date_key INT NULL,
@@ -41,11 +28,12 @@ CREATE TABLE Fact_Job_Performance (
     revenue_earned DECIMAL(12,2) NULL,
     service_quantity DECIMAL(8,2) NULL,
     source_file VARCHAR(255) NOT NULL,
-    source_row_id VARCHAR(100) NOT NULL,
+    source_file_hash VARCHAR(64) NOT NULL,
+    source_record_locator VARCHAR(150) NOT NULL,
     etl_batch_id VARCHAR(50) NOT NULL,
     loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pk_fact_job_perf PRIMARY KEY (performance_key),
-    CONSTRAINT uq_perf_source_record UNIQUE (source_file, source_row_id),
+    CONSTRAINT uq_perf_provenance UNIQUE (source_file_hash, source_record_locator),
     CONSTRAINT fk_perf_job FOREIGN KEY (job_key) 
         REFERENCES Dim_Job(job_key)
         ON UPDATE CASCADE ON DELETE RESTRICT,
@@ -60,15 +48,14 @@ CREATE TABLE Fact_Job_Performance (
         ON UPDATE CASCADE ON DELETE RESTRICT,
     CONSTRAINT fk_perf_location FOREIGN KEY (location_key) 
         REFERENCES Dim_Location(location_key)
-        ON UPDATE CASCADE ON DELETE RESTRICT
+        ON UPDATE CASCADE ON DELETE RESTRICT,
+    INDEX idx_perf_job_key (job_key),
+    INDEX idx_perf_date_key (date_key),
+    INDEX idx_perf_customer_key (customer_key),
+    INDEX idx_perf_service_key (service_key),
+    INDEX idx_perf_location_key (location_key),
+    INDEX idx_perf_batch (etl_batch_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE INDEX idx_perf_job_key ON Fact_Job_Performance(job_key);
-CREATE INDEX idx_perf_date_key ON Fact_Job_Performance(date_key);
-CREATE INDEX idx_perf_customer_key ON Fact_Job_Performance(customer_key);
-CREATE INDEX idx_perf_service_key ON Fact_Job_Performance(service_key);
-CREATE INDEX idx_perf_location_key ON Fact_Job_Performance(location_key);
-CREATE INDEX idx_perf_batch ON Fact_Job_Performance(etl_batch_id);
 
 
 -- -----------------------------------------------------------------------------
@@ -76,17 +63,11 @@ CREATE INDEX idx_perf_batch ON Fact_Job_Performance(etl_batch_id);
 -- -----------------------------------------------------------------------------
 -- Granularity: Exactly one record per individual expense transaction or voucher.
 --
--- Academic Rationale:
--- Captures direct job expenses at their natural disbursement grain (individual
--- receipts for fuel, casual labour day-wages, cleaning chemicals, equipment rentals).
--- Expenses are tied to the parent job via job_key. They are NEVER allocated
--- to individual service lines without empirical activity-based cost drivers.
---
--- Database Safeguard:
--- Composite uniqueness on (source_file, source_row_id) guarantees idempotent
--- ETL processing and prevents duplicate rows if a report is reprocessed.
+-- Robust Idempotency Safeguard:
+-- Composite uniqueness on (source_file_hash, source_record_locator) guarantees
+-- deterministic, non-duplicative ingestion across all expense vouchers.
 -- -----------------------------------------------------------------------------
-CREATE TABLE Fact_Job_Expenses (
+CREATE TABLE IF NOT EXISTS Fact_Job_Expenses (
     expense_key BIGINT AUTO_INCREMENT NOT NULL,
     job_key INT NOT NULL,
     date_key INT NULL,
@@ -97,11 +78,12 @@ CREATE TABLE Fact_Job_Expenses (
     is_verified BOOLEAN NOT NULL DEFAULT FALSE,
     has_receipt BOOLEAN NOT NULL DEFAULT FALSE,
     source_file VARCHAR(255) NOT NULL,
-    source_row_id VARCHAR(100) NOT NULL,
+    source_file_hash VARCHAR(64) NOT NULL,
+    source_record_locator VARCHAR(150) NOT NULL,
     etl_batch_id VARCHAR(50) NOT NULL,
     loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pk_fact_job_expenses PRIMARY KEY (expense_key),
-    CONSTRAINT uq_exp_source_record UNIQUE (source_file, source_row_id),
+    CONSTRAINT uq_exp_provenance UNIQUE (source_file_hash, source_record_locator),
     CONSTRAINT chk_positive_expense CHECK (expense_amount >= 0.00),
     CONSTRAINT fk_exp_job FOREIGN KEY (job_key) 
         REFERENCES Dim_Job(job_key)
@@ -114,12 +96,11 @@ CREATE TABLE Fact_Job_Expenses (
         ON UPDATE CASCADE ON DELETE RESTRICT,
     CONSTRAINT fk_exp_location FOREIGN KEY (location_key) 
         REFERENCES Dim_Location(location_key)
-        ON UPDATE CASCADE ON DELETE RESTRICT
+        ON UPDATE CASCADE ON DELETE RESTRICT,
+    INDEX idx_exp_job_key (job_key),
+    INDEX idx_exp_date_key (date_key),
+    INDEX idx_exp_cat_key (expense_cat_key),
+    INDEX idx_exp_location_key (location_key),
+    INDEX idx_exp_verified (is_verified),
+    INDEX idx_exp_batch (etl_batch_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE INDEX idx_exp_job_key ON Fact_Job_Expenses(job_key);
-CREATE INDEX idx_exp_date_key ON Fact_Job_Expenses(date_key);
-CREATE INDEX idx_exp_cat_key ON Fact_Job_Expenses(expense_cat_key);
-CREATE INDEX idx_exp_location_key ON Fact_Job_Expenses(location_key);
-CREATE INDEX idx_exp_verified ON Fact_Job_Expenses(is_verified);
-CREATE INDEX idx_exp_batch ON Fact_Job_Expenses(etl_batch_id);

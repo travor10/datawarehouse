@@ -2,13 +2,18 @@
 Aura Cleaning Solutions Data Mart - Database Connection & Engine Factory
 =============================================================================
 Provides unified connection management for MySQL 8 (Authoritative Data Mart)
-and isolated SQLite compatibility (Local Automated Tests & Dry-Runs).
+and isolated SQLite compatibility (Explicit Local Automated Tests & Dry-Runs).
+
+Strict Engine Policy:
+- If DB_ENGINE='mysql', MySQL drivers and connectivity are strictly required.
+- SQLite is used ONLY when explicitly requested (e.g. DB_ENGINE='sqlite' or test suites).
+- Silent driver or engine fallbacks are strictly prohibited.
 """
 
 import logging
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from config.settings import (
     DATABASE_DIR,
@@ -24,35 +29,54 @@ from config.settings import (
 logger = logging.getLogger("aura_data_mart.database")
 
 
+class ConfigurationError(Exception):
+    """Raised when database engine configuration or required drivers are missing."""
+    pass
+
+
 class DatabaseManager:
     """
     Manages database connections, transactions, and schema script executions
-    for both MySQL 8 and local SQLite test databases.
+    for MySQL 8 (Authoritative) and isolated SQLite test databases.
     """
 
     def __init__(self, engine_type: Optional[str] = None):
         self.engine_type = (engine_type or DB_ENGINE).lower()
         self._mysql_driver = None
-        self._detect_drivers()
 
-    def _detect_drivers(self):
-        """Detects available MySQL database drivers."""
         if self.engine_type == "mysql":
-            try:
-                import pymysql
+            self._detect_mysql_driver()
+        elif self.engine_type != "sqlite":
+            raise ConfigurationError(
+                f"Unsupported DB_ENGINE '{self.engine_type}'. Supported engines are 'mysql' and 'sqlite'."
+            )
 
-                self._mysql_driver = "pymysql"
-            except ImportError:
-                try:
-                    import mysql.connector
+    def _detect_mysql_driver(self):
+        """
+        Detects installed MySQL database drivers.
+        Raises ConfigurationError if no driver is installed. Never falls back silently.
+        """
+        try:
+            import pymysql
+            self._mysql_driver = "pymysql"
+            return
+        except ImportError:
+            pass
 
-                    self._mysql_driver = "mysql.connector"
-                except ImportError:
-                    logger.warning(
-                        "No MySQL driver found (neither pymysql nor mysql-connector-python). "
-                        "Falling back to SQLite for local operations."
-                    )
-                    self.engine_type = "sqlite"
+        try:
+            import mysql.connector
+            self._mysql_driver = "mysql.connector"
+            return
+        except ImportError:
+            pass
+
+        raise ConfigurationError(
+            "Database Configuration Error: DB_ENGINE is set to 'mysql', but neither "
+            "'pymysql' nor 'mysql-connector-python' is installed.\n"
+            "To resolve:\n"
+            "  1. Install MySQL drivers: pip install -r requirements.txt\n"
+            "  2. Or set DB_ENGINE=sqlite in your .env file strictly for isolated local unit testing."
+        )
 
     def get_connection(self):
         """
@@ -62,38 +86,47 @@ class DatabaseManager:
         """
         if self.engine_type == "mysql":
             return self._get_mysql_connection()
-        else:
+        elif self.engine_type == "sqlite":
             return self._get_sqlite_connection()
+        else:
+            raise ConfigurationError(f"Unsupported DB_ENGINE: {self.engine_type}")
 
     def _get_mysql_connection(self):
         """Establishes connection to MySQL 8 server."""
-        if self._mysql_driver == "pymysql":
-            import pymysql
+        try:
+            if self._mysql_driver == "pymysql":
+                import pymysql
 
-            return pymysql.connect(
-                host=MYSQL_HOST,
-                port=MYSQL_PORT,
-                user=MYSQL_USER,
-                password=MYSQL_PASSWORD,
-                database=MYSQL_DATABASE,
-                charset="utf8mb4",
-                autocommit=False,
-                cursorclass=pymysql.cursors.DictCursor,
-            )
-        elif self._mysql_driver == "mysql.connector":
-            import mysql.connector
+                return pymysql.connect(
+                    host=MYSQL_HOST,
+                    port=MYSQL_PORT,
+                    user=MYSQL_USER,
+                    password=MYSQL_PASSWORD,
+                    database=MYSQL_DATABASE,
+                    charset="utf8mb4",
+                    autocommit=False,
+                    cursorclass=pymysql.cursors.DictCursor,
+                )
+            elif self._mysql_driver == "mysql.connector":
+                import mysql.connector
 
-            return mysql.connector.connect(
-                host=MYSQL_HOST,
-                port=MYSQL_PORT,
-                user=MYSQL_USER,
-                password=MYSQL_PASSWORD,
-                database=MYSQL_DATABASE,
-                charset="utf8mb4",
-                autocommit=False,
-            )
-        else:
-            raise RuntimeError("Cannot establish MySQL connection: driver missing.")
+                return mysql.connector.connect(
+                    host=MYSQL_HOST,
+                    port=MYSQL_PORT,
+                    user=MYSQL_USER,
+                    password=MYSQL_PASSWORD,
+                    database=MYSQL_DATABASE,
+                    charset="utf8mb4",
+                    autocommit=False,
+                )
+            else:
+                raise ConfigurationError("No valid MySQL driver initialized.")
+        except Exception as e:
+            raise ConnectionError(
+                f"Failed to connect to MySQL 8 database '{MYSQL_DATABASE}' at {MYSQL_HOST}:{MYSQL_PORT} "
+                f"using user '{MYSQL_USER}': {e}\n"
+                f"Verify that MySQL Server is running and credentials in .env are correct."
+            ) from e
 
     def _get_sqlite_connection(self, in_memory: bool = False):
         """Establishes connection to local SQLite database with foreign keys enabled."""
@@ -104,12 +137,12 @@ class DatabaseManager:
             conn = sqlite3.connect(str(SQLITE_DB_PATH))
 
         conn.row_factory = sqlite3.Row
-        # Critical for relational integrity in SQLite
+        # Enforce foreign key constraints in SQLite
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
 
     def test_connection(self) -> Dict[str, Any]:
-        """Tests connectivity and returns database metadata."""
+        """Tests connectivity and returns database engine metadata."""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -156,11 +189,12 @@ class DatabaseManager:
         cleaned = re.sub(r"CREATE\s+OR\s+REPLACE\s+VIEW", "CREATE VIEW IF NOT EXISTS", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"ON\s+DUPLICATE\s+KEY\s+UPDATE.*?(?=;|$)", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
         cleaned = re.sub(r"CALL\s+sp_populate_dim_date\(.*?\);?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"CALL\s+sp_extend_dim_date\(.*?\);?", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"ENGINE\s*=\s*InnoDB.*?;", ";", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"DEFAULT\s+CHARSET\s*=\s*[a-zA-Z0-9_]+", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"COLLATE\s*=\s*[a-zA-Z0-9_]+", "", cleaned, flags=re.IGNORECASE)
 
-        # In SQLite, an AUTOINCREMENT column MUST be PRIMARY KEY directly on the column definition:
+        # Handle AUTO_INCREMENT columns for SQLite
         auto_cols = re.findall(
             r"(\b[a-zA-Z0-9_]+_key\b)\s+(?:BIGINT|INT)\s+AUTO_INCREMENT\s+NOT\s+NULL",
             cleaned,
@@ -180,6 +214,27 @@ class DatabaseManager:
                 flags=re.IGNORECASE,
             )
 
+        # In SQLite, remove inline ', INDEX ...' from CREATE TABLE and convert to standalone CREATE INDEX
+        standalone_indexes = []
+        for match in re.finditer(
+            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s*\((.*?)\);",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            tbl_name = match.group(1)
+            body = match.group(2)
+            idx_matches = re.findall(
+                r"INDEX\s+([a-zA-Z0-9_]+)\s*\((.*?)\)", body, flags=re.IGNORECASE
+            )
+            for idx_name, idx_cols in idx_matches:
+                standalone_indexes.append(
+                    f"CREATE INDEX IF NOT EXISTS {idx_name} ON {tbl_name} ({idx_cols});"
+                )
+
+        cleaned = re.sub(
+            r",\s*INDEX\s+[a-zA-Z0-9_]+\s*\(.*?\)", "", cleaned, flags=re.IGNORECASE
+        )
+
         # Adjust MySQL types to SQLite affinities
         cleaned = re.sub(r"\bTINYINT\s+UNSIGNED\b", "INTEGER", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bSMALLINT\s+UNSIGNED\b", "INTEGER", cleaned, flags=re.IGNORECASE)
@@ -187,6 +242,9 @@ class DatabaseManager:
         cleaned = re.sub(r"\bSMALLINT\b", "INTEGER", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bBIGINT\b", "INTEGER", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\bDECIMAL\(\d+,\s*\d+\)\b", "NUMERIC", cleaned, flags=re.IGNORECASE)
+
+        if standalone_indexes:
+            cleaned += "\n" + "\n".join(standalone_indexes)
 
         return cleaned
 
@@ -213,7 +271,7 @@ class DatabaseManager:
                     try:
                         cursor.execute(stmt)
                     except Exception as stmt_err:
-                        # Log but continue for harmless drop statements
+                        # Log but continue for harmless duplicate statements in testing
                         if "already exists" not in str(stmt_err).lower() and "no such table" not in str(stmt_err).lower():
                             logger.debug(f"Statement execution notice: {stmt_err}")
                 conn.commit()
@@ -227,4 +285,6 @@ class DatabaseManager:
 
 
 # Default singleton instance
-db_manager = DatabaseManager()
+# In testing environments without configured MySQL, instantiate DatabaseManager('sqlite') explicitly.
+def get_db_manager(engine_type: Optional[str] = None) -> DatabaseManager:
+    return DatabaseManager(engine_type=engine_type)

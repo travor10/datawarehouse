@@ -2,13 +2,14 @@
 -- Aura Cleaning Solutions Data Mart
 -- Script: insert_reference_data.sql
 -- Target Engine: MySQL 8.0+
--- Description: Seeds initial reference dimensions with canonical metadata.
+-- Description: Seeds initial reference dimensions with canonical metadata and
+--              dynamic date generation supporting historical data through 2026+.
 -- =============================================================================
 
 USE aura_data_mart;
 
 -- -----------------------------------------------------------------------------
--- 1. Seed Dim_Expense_Category
+-- 1. Seed Dim_Expense_Category (Canonical Direct Costs)
 -- -----------------------------------------------------------------------------
 INSERT INTO Dim_Expense_Category (expense_category_name, cost_type) VALUES
 ('Labour Wages', 'Direct Operational Cost'),
@@ -51,7 +52,7 @@ INSERT INTO Dim_Service (service_code, service_name_clean, service_name_raw, ser
 ('SRV-LND-BLK', 'Commercial Bulk Laundry Service', 'Bulk Laundry', 'Laundry Services', FALSE),
 ('SRV-LND-CUR', 'Curtains & Drapes Laundry Service', 'Curtains Laundry', 'Laundry Services', FALSE),
 
--- Catch-all for unmapped services flagged for review
+-- Unclassified fallback flagged for human review
 ('SRV-UNCLASS', 'Unclassified Service', 'Unclassified / Pending Review', 'Under Review', TRUE)
 ON DUPLICATE KEY UPDATE 
     service_name_clean = VALUES(service_name_clean),
@@ -59,11 +60,7 @@ ON DUPLICATE KEY UPDATE
 
 
 -- -----------------------------------------------------------------------------
--- 3. Dynamic Stored Procedure: Generate Dim_Date Range
--- -----------------------------------------------------------------------------
--- Academic Rationale:
--- Generates date records strictly within the active operational boundary
--- of Aura's historical trading records.
+-- 3. Stored Procedure: Populate Dim_Date for an Arbitrary Date Range
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_populate_dim_date;
 
@@ -102,8 +99,45 @@ BEGIN
 END$$
 DELIMITER ;
 
--- Generate initial calendar for 2023 through 2025 (Expanded dynamically by ETL if older/newer dates exist)
-CALL sp_populate_dim_date('2023-01-01', '2025-12-31');
+
+-- -----------------------------------------------------------------------------
+-- 4. Dynamic Stored Procedure: Extend Calendar to Cover Any Target Date
+-- -----------------------------------------------------------------------------
+-- Academic Rationale:
+-- When an ETL batch encounters a historical or future date outside the currently
+-- seeded calendar, this procedure dynamically extends Dim_Date to that date,
+-- ensuring referential integrity without manual DBA intervention.
+-- -----------------------------------------------------------------------------
+DROP PROCEDURE IF EXISTS sp_extend_dim_date;
+
+DELIMITER $$
+CREATE PROCEDURE sp_extend_dim_date(IN target_date DATE)
+BEGIN
+    DECLARE min_existing DATE;
+    DECLARE max_existing DATE;
+
+    IF target_date IS NOT NULL THEN
+        SELECT MIN(full_date), MAX(full_date) INTO min_existing, max_existing FROM Dim_Date;
+
+        IF min_existing IS NULL THEN
+            -- Table is empty; seed the single year around target_date
+            CALL sp_populate_dim_date(
+                STR_TO_DATE(CONCAT(YEAR(target_date), '-01-01'), '%Y-%m-%d'),
+                STR_TO_DATE(CONCAT(YEAR(target_date), '-12-31'), '%Y-%m-%d')
+            );
+        ELSEIF target_date < min_existing THEN
+            -- Prepend historical range
+            CALL sp_populate_dim_date(target_date, DATE_SUB(min_existing, INTERVAL 1 DAY));
+        ELSEIF target_date > max_existing THEN
+            -- Append future range
+            CALL sp_populate_dim_date(DATE_ADD(max_existing, INTERVAL 1 DAY), target_date);
+        END IF;
+    END IF;
+END$$
+DELIMITER ;
+
+-- Seed calendar from 2023-01-01 through 2026-12-31 (encompassing Aura's full historical range)
+CALL sp_populate_dim_date('2023-01-01', '2026-12-31');
 
 -- Verification counts
 SELECT 'Dim_Expense_Category' AS table_name, COUNT(*) AS record_count FROM Dim_Expense_Category
